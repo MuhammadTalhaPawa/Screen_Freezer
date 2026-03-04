@@ -10,7 +10,7 @@ Hotkeys:
     F1  -> Freeze all screens
     F2  -> Unfreeze all screens
 """
-
+ 
 import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw
 import mss
