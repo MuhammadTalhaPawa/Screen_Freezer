@@ -188,6 +188,21 @@ _MODIFIER_KEYS = frozenset({
     keyboard.Key.alt_gr,
 })
 
+# VK → display name map for common keys (so vk81 shows as Q, etc.)
+def _vk_display(vk: int) -> str:
+    if 65 <= vk <= 90:           return chr(vk)           # A-Z
+    if 48 <= vk <= 57:           return chr(vk)           # 0-9
+    if 112 <= vk <= 123:         return f"F{vk - 111}"    # F1-F12
+    _vk_map = {
+        8:"backspace", 9:"tab", 13:"enter", 27:"esc",
+        32:"space", 33:"pageup", 34:"pagedown", 35:"end", 36:"home",
+        37:"left", 38:"up", 39:"right", 40:"down",
+        45:"insert", 46:"delete",
+        186:";", 187:"=", 188:",", 189:"-", 190:".", 191:"/",
+        192:"`", 219:"[", 220:"\\", 221:"]", 222:"'"
+    }
+    return _vk_map.get(vk, f"vk{vk}")
+
 def is_modifier(key) -> bool:
     return key in _MODIFIER_KEYS
 
@@ -205,14 +220,22 @@ def active_mods(keys_set) -> frozenset:
     return frozenset(m)
 
 def key_to_str(key) -> str:
+    """Convert a pynput key to a canonical storage string (vk-first)."""
     if isinstance(key, keyboard.Key):
         return key.name
-    if isinstance(key, keyboard.KeyCode) and key.char:
-        return key.char
+    if isinstance(key, keyboard.KeyCode):
+        # Prefer vk so the stored value is modifier-independent
+        if key.vk is not None:
+            return f"vk{key.vk}"
+        if key.char:
+            return key.char.lower()
     return str(key)
 
 def str_to_pynput_key(s: str):
     s = s.strip().lower()
+    # vk-encoded keys like "vk81"
+    if s.startswith("vk") and s[2:].isdigit():
+        return keyboard.KeyCode(vk=int(s[2:]))
     try:
         return getattr(keyboard.Key, s)
     except AttributeError:
@@ -222,13 +245,13 @@ def str_to_pynput_key(s: str):
     return None
 
 def build_combo(mods: frozenset, key) -> str:
-    """Canonical combo string, e.g. 'ctrl+shift+f1'."""
+    """Canonical combo string, e.g. 'ctrl+shift+vk81'."""
     parts = sorted(mods) + [key_to_str(key)]
     return "+".join(parts)
 
 def parse_combo(s: str):
     """
-    Parse 'ctrl+shift+f1' → (frozenset({'ctrl','shift'}), pynput_key).
+    Parse 'ctrl+shift+vk81' → (frozenset({'ctrl','shift'}), pynput_key).
     Returns (None, None) for empty / invalid strings.
     """
     if not s or s in ("—", "— not set —", ""):
@@ -242,10 +265,20 @@ def parse_combo(s: str):
     return mods, str_to_pynput_key(keys[-1])
 
 def combo_display(s: str) -> str:
-    """Human-readable uppercase label for a combo string."""
+    """Human-readable uppercase label, e.g. 'ctrl+shift+vk81' → 'CTRL+SHIFT+Q'."""
     if not s or s in ("—", "— not set —", ""):
         return "— not set —"
-    return s.upper()
+    mod_names = {"ctrl", "shift", "alt"}
+    parts = s.strip().lower().split("+")
+    result = []
+    for p in parts:
+        if p in mod_names:
+            result.append(p.upper())
+        elif p.startswith("vk") and p[2:].isdigit():
+            result.append(_vk_display(int(p[2:])).upper())
+        else:
+            result.append(p.upper())
+    return "+".join(result)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -700,9 +733,11 @@ class ScreenFreezer:
         if self.frozen:
             return
         if not self.saved_screenshots:
-            ck = self.config["capture_key"].upper()
-            print(f"\nNo capture yet — press {ck} first.\n")
-            return
+            print("\nNo saved screenshots — auto-capturing now before freeze…")
+            self.capture_and_save()
+            if not self.saved_screenshots:
+                print("Auto-capture failed. Cannot freeze.\n")
+                return
 
         print("Freezing screens…")
         self.frozen       = True
@@ -785,7 +820,16 @@ class ScreenFreezer:
         elif isinstance(main_key, keyboard.KeyCode):
             if not isinstance(key, keyboard.KeyCode):
                 return False
-            if key.char != main_key.char:
+            # Compare by vk (virtual key code) — modifier-independent.
+            # key.char can be None or a control char when modifiers are held,
+            # so vk is the only reliable comparison when modifiers are present.
+            if main_key.vk is not None and key.vk is not None:
+                if key.vk != main_key.vk:
+                    return False
+            elif main_key.char and key.char:
+                if key.char.lower() != main_key.char.lower():
+                    return False
+            else:
                 return False
         else:
             return False
