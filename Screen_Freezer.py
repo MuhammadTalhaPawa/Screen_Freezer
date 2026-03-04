@@ -890,7 +890,6 @@ class ScreenFreezer:
         print(f"\n  {c['capture_key'].upper():<8} Capture & save all monitors")
         print(f"  {c['freeze_key'].upper():<8} Freeze (shows last capture)")
         print(f"  {c['unfreeze_key'].upper():<8} Unfreeze")
-        print(f"\n  Folder: {c['capture_folder']}")
         print("\n  Tray icon → Settings to change hotkeys")
         print("=" * 60 + "\n")
 
