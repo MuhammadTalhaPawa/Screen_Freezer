@@ -179,6 +179,31 @@ def save_config(cfg: dict):
     except Exception as e:
         print(f"Warning: could not save config: {e}")
 
+# ── Modifier helpers ──────────────────────────────────────────────────────────
+
+_MODIFIER_KEYS = frozenset({
+    keyboard.Key.ctrl,   keyboard.Key.ctrl_l,  keyboard.Key.ctrl_r,
+    keyboard.Key.shift,  keyboard.Key.shift_l, keyboard.Key.shift_r,
+    keyboard.Key.alt,    keyboard.Key.alt_l,   keyboard.Key.alt_r,
+    keyboard.Key.alt_gr,
+})
+
+def is_modifier(key) -> bool:
+    return key in _MODIFIER_KEYS
+
+def active_mods(keys_set) -> frozenset:
+    """Return frozenset of 'ctrl'/'shift'/'alt' currently held."""
+    m = set()
+    for k in keys_set:
+        if k in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+            m.add("ctrl")
+        elif k in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
+            m.add("shift")
+        elif k in (keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r,
+                   keyboard.Key.alt_gr):
+            m.add("alt")
+    return frozenset(m)
+
 def key_to_str(key) -> str:
     if isinstance(key, keyboard.Key):
         return key.name
@@ -195,6 +220,32 @@ def str_to_pynput_key(s: str):
     if len(s) == 1:
         return keyboard.KeyCode.from_char(s)
     return None
+
+def build_combo(mods: frozenset, key) -> str:
+    """Canonical combo string, e.g. 'ctrl+shift+f1'."""
+    parts = sorted(mods) + [key_to_str(key)]
+    return "+".join(parts)
+
+def parse_combo(s: str):
+    """
+    Parse 'ctrl+shift+f1' → (frozenset({'ctrl','shift'}), pynput_key).
+    Returns (None, None) for empty / invalid strings.
+    """
+    if not s or s in ("—", "— not set —", ""):
+        return None, None
+    mod_names = {"ctrl", "shift", "alt"}
+    parts     = s.strip().lower().split("+")
+    mods      = frozenset(p for p in parts if p in mod_names)
+    keys      = [p for p in parts if p not in mod_names]
+    if not keys:
+        return None, None
+    return mods, str_to_pynput_key(keys[-1])
+
+def combo_display(s: str) -> str:
+    """Human-readable uppercase label for a combo string."""
+    if not s or s in ("—", "— not set —", ""):
+        return "— not set —"
+    return s.upper()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -394,7 +445,7 @@ class SettingsWindow:
             row=row, column=0, sticky="ew",
             padx=(24, 10), pady=4)
 
-        val = self.config.get(cfg_key, "—").upper()
+        val = combo_display(self.config.get(cfg_key, ""))
         btn = tk.Button(
             parent, text=val, width=12,
             bg=self.CARD, fg=self.ACCENT,
@@ -417,27 +468,58 @@ class SettingsWindow:
             self._stop_record(cancelled=True)
 
         self._recording = cfg_key
-        btn.config(text="▶ press a key…", bg=self.ORANGE, fg="#1e1e2e")
+        btn.config(text="hold mods + key…", bg=self.ORANGE, fg="#1e1e2e")
+
+        held = set()   # modifier keys currently held during recording
 
         def _on_press(key):
             if self._recording != cfg_key:
                 return False
-            ks = key_to_str(key)
-            self.config[cfg_key] = ks
+            if is_modifier(key):
+                held.add(key)
+                # Update button to show which modifiers are held so far
+                mod_label = "+".join(sorted(active_mods(held))) or "…"
+                if self._win:
+                    self._win.after(0, lambda ml=mod_label:
+                        btn.config(text=ml + " + ?"))
+                return  # keep listening for the main key
+            # Non-modifier key → finalise combo
+            combo = build_combo(active_mods(held), key)
+            self.config[cfg_key] = combo
             if self._win:
-                self._win.after(
-                    0, lambda: self._apply_record(btn, cfg_key, ks))
-            return False
+                self._win.after(0, lambda c=combo: self._apply_record(btn, cfg_key, c))
+            return False  # stop listener
 
-        lst = keyboard.Listener(on_press=_on_press)
+        def _on_release(key):
+            held.discard(key)
+
+        lst = keyboard.Listener(on_press=_on_press, on_release=_on_release)
         lst.daemon = True
         lst.start()
         self._tmp_listener = lst
 
-    def _apply_record(self, btn: tk.Button, cfg_key: str, key_str: str):
-        btn.config(text=key_str.upper(), bg=self.CARD, fg=self.ACCENT)
+    def _apply_record(self, btn: tk.Button, cfg_key: str, combo: str):
+        btn.config(text=combo_display(combo), bg=self.CARD, fg=self.ACCENT)
         self._recording    = None
         self._tmp_listener = None
+
+        # ── Conflict detection ──────────────────────────────────────────────
+        # If this combo was already assigned to another action, clear that one
+        # so no two actions share the same shortcut.
+        all_shortcut_keys = ["capture_key", "freeze_key", "unfreeze_key"]
+        for other in all_shortcut_keys:
+            if other == cfg_key:
+                continue
+            if self.config.get(other, "") == combo:
+                self.config[other] = ""
+                other_btn = self._btns.get(other)
+                if other_btn:
+                    other_btn.config(
+                        text="— not set —",
+                        bg=self.CARD, fg=self.DIM,
+                    )
+                print(f"  ⚠  Conflict: cleared '{other}' "
+                      f"(was also bound to {combo_display(combo)})")
 
     def _stop_record(self, cancelled: bool = False):
         if self._tmp_listener:
@@ -450,8 +532,13 @@ class SettingsWindow:
         if cancelled and self._recording:
             btn = self._btns.get(self._recording)
             if btn:
-                orig = self.config.get(self._recording, "—").upper()
-                btn.config(text=orig, bg=self.CARD, fg=self.ACCENT)
+                orig = self.config.get(self._recording, "")
+                if orig:
+                    btn.config(text=combo_display(orig),
+                               bg=self.CARD, fg=self.ACCENT)
+                else:
+                    btn.config(text="— not set —",
+                               bg=self.CARD, fg=self.DIM)
 
         self._recording = None
 
@@ -686,14 +773,24 @@ class ScreenFreezer:
     # ── Keyboard listener ──────────────────────────────────────
 
     def _matches(self, key, cfg_name: str) -> bool:
-        target = str_to_pynput_key(self.config.get(cfg_name, ""))
-        if target is None:
+        """Check whether the pressed key completes the configured combo."""
+        combo_str = self.config.get(cfg_name, "")
+        mods_req, main_key = parse_combo(combo_str)
+        if main_key is None:
             return False
-        if isinstance(target, keyboard.Key):
-            return key == target
-        if isinstance(target, keyboard.KeyCode) and isinstance(key, keyboard.KeyCode):
-            return key.char == target.char
-        return False
+        # Main key must match
+        if isinstance(main_key, keyboard.Key):
+            if key != main_key:
+                return False
+        elif isinstance(main_key, keyboard.KeyCode):
+            if not isinstance(key, keyboard.KeyCode):
+                return False
+            if key.char != main_key.char:
+                return False
+        else:
+            return False
+        # All required modifiers must be currently held
+        return active_mods(self.current_keys) == mods_req
 
     def on_press(self, key):
         try:
@@ -703,6 +800,10 @@ class ScreenFreezer:
 
         # All hotkeys are silenced while the Settings window is open
         if self.shortcuts_paused:
+            return
+
+        # Modifier-only presses never trigger actions on their own
+        if is_modifier(key):
             return
 
         if self._matches(key, "capture_key"):
