@@ -9,39 +9,158 @@ Default Hotkeys:
     F1  -> Freeze screens (shows last captured screenshots)
     F2  -> Unfreeze screens
 
-All hotkeys are fully configurable via:
-    System Tray Icon → Settings
+All hotkeys are configurable via:  System Tray → Settings
 """
 
 import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw
 import mss
 from pynput import keyboard
-import sys
-import time
-import os
-import json
-import threading
-import datetime
+import sys, time, os, json, threading, datetime, math, io
 import pystray
 from pystray import MenuItem as item
 from tkinter import filedialog
 
 
 # ─────────────────────────────────────────────────────────────
+#  Icon factory  –  monitor + snowflake
+# ─────────────────────────────────────────────────────────────
+
+def _draw_snowflake(draw, cx, cy, r, color, lw):
+    """Draw a 6-arm snowflake centred at (cx, cy) with radius r."""
+    for deg in range(0, 360, 60):
+        rad = math.radians(deg)
+        ex  = cx + r * math.cos(rad)
+        ey  = cy + r * math.sin(rad)
+        draw.line([(cx, cy), (ex, ey)], fill=color, width=lw)
+        # two short branches at 50 % length
+        for branch in (-30, 30):
+            b_rad = math.radians(deg + branch)
+            mid_x = cx + r * 0.50 * math.cos(rad)
+            mid_y = cy + r * 0.50 * math.sin(rad)
+            tip_x = mid_x + r * 0.28 * math.cos(b_rad)
+            tip_y = mid_y + r * 0.28 * math.sin(b_rad)
+            draw.line([(mid_x, mid_y), (tip_x, tip_y)], fill=color, width=lw)
+
+
+def make_app_icon(size: int = 256) -> Image.Image:
+    """
+    Returns an RGBA PIL image of the app icon at the requested square size.
+    Scales all measurements proportionally so it looks sharp at any size.
+    """
+    s   = size
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d   = ImageDraw.Draw(img)
+    cx  = cy = s / 2
+
+    # ── Monitor body ─────────────────────────────────────────
+    mw = s * 0.72            # monitor width
+    mh = s * 0.52            # monitor height
+    mx = (s - mw) / 2
+    my = s * 0.12
+    radius = s * 0.05
+
+    d.rounded_rectangle(
+        [mx, my, mx + mw, my + mh],
+        radius=radius,
+        fill=(22, 36, 62),
+        outline=(72, 148, 232),
+        width=max(2, int(s * 0.022)),
+    )
+
+    # ── Screen glass (inner dark area) ──────────────────────
+    pad = s * 0.048
+    d.rectangle(
+        [mx + pad, my + pad, mx + mw - pad, my + mh - pad],
+        fill=(8, 16, 44),
+    )
+
+    # ── Subtle blue gradient sheen across screen ─────────────
+    sheen_h = int((mh - 2 * pad) * 0.35)
+    sheen_x0 = int(mx + pad)
+    sheen_x1 = int(mx + mw - pad)
+    sheen_y0 = int(my + pad)
+    for row in range(sheen_h):
+        alpha = int(28 * (1 - row / sheen_h))
+        d.line([(sheen_x0, sheen_y0 + row), (sheen_x1, sheen_y0 + row)],
+               fill=(100, 180, 255, alpha))
+
+    # ── Snowflake inside screen ──────────────────────────────
+    sf_cx = s / 2
+    sf_cy = my + mh / 2 - s * 0.02
+    sf_r  = mh * 0.32
+    lw    = max(2, int(s * 0.020))
+
+    # glow ring (soft, slightly bigger, lighter)
+    _draw_snowflake(d, sf_cx, sf_cy, sf_r * 1.08,
+                    (100, 180, 255, 60), lw + 2)
+    # main snowflake
+    _draw_snowflake(d, sf_cx, sf_cy, sf_r,
+                    (160, 215, 255), lw)
+    # centre dot
+    dot_r = s * 0.030
+    d.ellipse([sf_cx - dot_r, sf_cy - dot_r,
+               sf_cx + dot_r, sf_cy + dot_r],
+              fill=(210, 240, 255))
+
+    # ── Stand neck ───────────────────────────────────────────
+    neck_w  = s * 0.050
+    neck_h  = s * 0.110
+    neck_x  = cx - neck_w / 2
+    neck_y  = my + mh
+    d.rectangle([neck_x, neck_y, neck_x + neck_w, neck_y + neck_h],
+                fill=(22, 36, 62))
+
+    # ── Stand base ───────────────────────────────────────────
+    base_w = s * 0.38
+    base_h = s * 0.060
+    base_x = cx - base_w / 2
+    base_y = neck_y + neck_h - base_h * 0.3
+    d.rounded_rectangle(
+        [base_x, base_y, base_x + base_w, base_y + base_h],
+        radius=int(base_h * 0.4),
+        fill=(22, 36, 62),
+        outline=(72, 148, 232),
+        width=max(1, int(s * 0.016)),
+    )
+
+    return img
+
+
+def make_tray_icon() -> Image.Image:
+    """64×64 tray icon (same design, smaller)."""
+    return make_app_icon(64)
+
+
+def make_tk_icon(root_win: tk.Tk, size: int = 32) -> tk.PhotoImage:
+    """
+    Return a Tkinter-compatible PhotoImage for use as a window icon.
+    Works on Windows and Linux (wm_iconphoto).
+    """
+    img  = make_app_icon(size)
+    data = io.BytesIO()
+    img.save(data, format="PNG")
+    data.seek(0)
+    return tk.PhotoImage(data=data.read())
+
+
+# ─────────────────────────────────────────────────────────────
 #  Config
 # ─────────────────────────────────────────────────────────────
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_freezer_config.json")
-
+CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "screen_freezer_config.json"
+)
 DEFAULT_CONFIG = {
-    "freeze_key":      "f1",
-    "unfreeze_key":    "f2",
-    "capture_key":     "f3",
-    "capture_folder":  os.path.join(os.path.expanduser("~"), "Pictures", "ScreenFreezer"),
+    "freeze_key":     "f1",
+    "unfreeze_key":   "f2",
+    "capture_key":    "f3",
+    "capture_folder": os.path.join(
+        os.path.expanduser("~"), "Pictures", "ScreenFreezer"
+    ),
 }
 
-def load_config():
+def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH) as f:
@@ -53,7 +172,7 @@ def load_config():
             pass
     return DEFAULT_CONFIG.copy()
 
-def save_config(cfg):
+def save_config(cfg: dict):
     try:
         with open(CONFIG_PATH, "w") as f:
             json.dump(cfg, f, indent=2)
@@ -93,13 +212,16 @@ class SettingsWindow:
     ORANGE = "#fab387"
 
     def __init__(self, master, config: dict, on_save_cb):
-        self.master       = master
-        self.config       = config.copy()
-        self.on_save_cb   = on_save_cb
-        self._win         = None
-        self._btns        = {}          # cfg_key -> Button widget
-        self._recording   = None        # cfg_key currently being recorded
+        self.master        = master
+        self.config        = config.copy()
+        self.on_save_cb    = on_save_cb
+        self._win          = None
+        self._btns         = {}
+        self._recording    = None
         self._tmp_listener = None
+        # Keep PhotoImage refs alive
+        self._tk_icon_big  = None
+        self._tk_icon_wm   = None
 
     # ── Public ───────────────────────────────────────────────
 
@@ -111,65 +233,84 @@ class SettingsWindow:
                 return
             except tk.TclError:
                 self._win = None
-
         self._build()
 
-    # ── Window construction ──────────────────────────────────
+    # ── Build ────────────────────────────────────────────────
 
     def _build(self):
         win = tk.Toplevel(self.master)
         self._win = win
-        win.title("Settings")
+        win.title("Settings  —  Screen Freezer")
         win.configure(bg=self.BG)
         win.resizable(False, False)
         win.attributes("-topmost", True)
         win.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
-        # ────────────────────────────────────────────
-        #  Title
-        # ────────────────────────────────────────────
-        tk.Label(
-            win, text="  Screen Freezer  —  Settings",
-            bg=self.BG, fg=self.ACCENT,
-            font=("Segoe UI", 14, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, columnspan=3, sticky="ew",
-               padx=24, pady=(20, 4))
+        # ── Window icon (title bar) ──────────────────────────
+        try:
+            self._tk_icon_wm = make_tk_icon(win, size=48)
+            win.wm_iconphoto(False, self._tk_icon_wm)
+        except Exception:
+            pass
 
+        # ── Header row: big icon + title text ────────────────
+        header = tk.Frame(win, bg=self.BG)
+        header.grid(row=0, column=0, columnspan=3, sticky="ew",
+                    padx=24, pady=(20, 6))
+
+        try:
+            pil_icon = make_app_icon(64)
+            self._tk_icon_big = ImageTk.PhotoImage(pil_icon)
+            tk.Label(header, image=self._tk_icon_big,
+                     bg=self.BG).pack(side="left", padx=(0, 14))
+        except Exception:
+            pass
+
+        text_col = tk.Frame(header, bg=self.BG)
+        text_col.pack(side="left", anchor="w")
+
+        tk.Label(text_col, text="Screen Freezer",
+                 bg=self.BG, fg=self.ACCENT,
+                 font=("Segoe UI", 16, "bold"),
+                 anchor="w").pack(anchor="w")
+
+        tk.Label(text_col,
+                 text="Freeze your monitors with a single keypress.",
+                 bg=self.BG, fg=self.DIM,
+                 font=("Segoe UI", 9),
+                 anchor="w").pack(anchor="w", pady=(2, 0))
+
+        # ── Divider ──────────────────────────────────────────
+        self._divider(win, row=1)
+
+        # ── Hint ─────────────────────────────────────────────
         tk.Label(
             win,
-            text="Click a shortcut button, then press any key on your keyboard to rebind it.",
+            text="Click a shortcut button, then press any key to rebind it.",
             bg=self.BG, fg=self.DIM,
-            font=("Segoe UI", 9),
-            anchor="w", wraplength=400,
-        ).grid(row=1, column=0, columnspan=3, sticky="ew",
-               padx=24, pady=(0, 10))
+            font=("Segoe UI", 9), anchor="w",
+        ).grid(row=2, column=0, columnspan=3,
+               sticky="ew", padx=24, pady=(0, 6))
 
-        # ────────────────────────────────────────────
-        #  Section header — shortcuts
-        # ────────────────────────────────────────────
-        self._section(win, row=2, text="KEYBOARD SHORTCUTS")
+        # ── Section: shortcuts ───────────────────────────────
+        self._section(win, row=3, text="KEYBOARD SHORTCUTS")
 
-        # ────────────────────────────────────────────
-        #  Shortcut rows
-        # ────────────────────────────────────────────
         shortcuts = [
             ("capture_key",  "📸  Capture & save screenshots"),
             ("freeze_key",   "🔒  Freeze screens"),
             ("unfreeze_key", "🔓  Unfreeze screens"),
         ]
-        for grid_row, (cfg_key, label) in enumerate(shortcuts, start=3):
+        for grid_row, (cfg_key, label) in enumerate(shortcuts, start=4):
             self._shortcut_row(win, grid_row, cfg_key, label)
 
-        # ────────────────────────────────────────────
-        #  Section header — folder
-        # ────────────────────────────────────────────
-        self._section(win, row=6, text="SCREENSHOT SAVE FOLDER")
+        # ── Divider ──────────────────────────────────────────
+        self._divider(win, row=7)
 
-        # ────────────────────────────────────────────
-        #  Folder row
-        # ────────────────────────────────────────────
-        self._folder_var = tk.StringVar(value=self.config.get("capture_folder", ""))
+        # ── Section: folder ──────────────────────────────────
+        self._section(win, row=8, text="SCREENSHOT SAVE FOLDER")
+
+        self._folder_var = tk.StringVar(
+            value=self.config.get("capture_folder", ""))
 
         folder_entry = tk.Entry(
             win,
@@ -180,7 +321,7 @@ class SettingsWindow:
             font=("Segoe UI", 9),
             width=34,
         )
-        folder_entry.grid(row=7, column=0, columnspan=2,
+        folder_entry.grid(row=9, column=0, columnspan=2,
                           padx=(24, 6), pady=6, ipady=7, sticky="ew")
 
         tk.Button(
@@ -190,24 +331,18 @@ class SettingsWindow:
             relief="flat", bd=0, padx=10, pady=7,
             font=("Segoe UI", 9), cursor="hand2",
             command=self._browse,
-        ).grid(row=7, column=2, padx=(0, 24), pady=6, sticky="w")
+        ).grid(row=9, column=2, padx=(0, 24), pady=6, sticky="w")
 
-        # ────────────────────────────────────────────
-        #  Divider
-        # ────────────────────────────────────────────
-        tk.Frame(win, bg="#45475a", height=1).grid(
-            row=8, column=0, columnspan=3,
-            sticky="ew", padx=20, pady=10)
+        # ── Divider ──────────────────────────────────────────
+        self._divider(win, row=10)
 
-        # ────────────────────────────────────────────
-        #  Save / Cancel buttons
-        # ────────────────────────────────────────────
-        btn_frame = tk.Frame(win, bg=self.BG)
-        btn_frame.grid(row=9, column=0, columnspan=3,
-                       sticky="e", padx=24, pady=(0, 20))
+        # ── Save / Cancel ────────────────────────────────────
+        btn_row = tk.Frame(win, bg=self.BG)
+        btn_row.grid(row=11, column=0, columnspan=3,
+                     sticky="e", padx=24, pady=(4, 20))
 
         tk.Button(
-            btn_frame, text="Cancel",
+            btn_row, text="Cancel",
             bg=self.CARD, fg=self.FG,
             activebackground="#45475a", activeforeground=self.FG,
             relief="flat", bd=0, padx=18, pady=8,
@@ -216,7 +351,7 @@ class SettingsWindow:
         ).pack(side="right", padx=(8, 0))
 
         tk.Button(
-            btn_frame, text="Save",
+            btn_row, text="  Save  ",
             bg=self.GREEN, fg="#1e1e2e",
             activebackground="#94d4a0", activeforeground="#1e1e2e",
             relief="flat", bd=0, padx=18, pady=8,
@@ -224,7 +359,6 @@ class SettingsWindow:
             command=self._on_save,
         ).pack(side="right")
 
-        # Constrain column widths so the grid looks tidy
         win.columnconfigure(0, weight=1)
         win.columnconfigure(1, weight=0)
         win.columnconfigure(2, weight=0)
@@ -232,41 +366,40 @@ class SettingsWindow:
         win.update_idletasks()
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
-        ww = win.winfo_reqwidth()
+        ww = max(win.winfo_reqwidth(), 480)
         wh = win.winfo_reqheight()
-        win.geometry(f"{max(ww, 460)}x{wh}+{(sw - max(ww, 460)) // 2}+{(sh - wh) // 2}")
+        win.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 2}")
 
-    # ── Helper widgets ────────────────────────────────────────
+    # ── Widget helpers ────────────────────────────────────────
+
+    def _divider(self, parent, row: int):
+        tk.Frame(parent, bg="#45475a", height=1).grid(
+            row=row, column=0, columnspan=3,
+            sticky="ew", padx=20, pady=6)
 
     def _section(self, parent, row: int, text: str):
-        """Small muted section-header label."""
-        tk.Label(
-            parent, text=text,
-            bg=self.BG, fg=self.DIM,
-            font=("Segoe UI", 8, "bold"),
-            anchor="w",
-        ).grid(row=row, column=0, columnspan=3,
-               sticky="ew", padx=24, pady=(10, 2))
+        tk.Label(parent, text=text,
+                 bg=self.BG, fg=self.DIM,
+                 font=("Segoe UI", 8, "bold"),
+                 anchor="w").grid(
+            row=row, column=0, columnspan=3,
+            sticky="ew", padx=24, pady=(4, 2))
 
     def _shortcut_row(self, parent, row: int, cfg_key: str, label: str):
-        """One label + one key-capture button."""
-        tk.Label(
-            parent, text=label,
-            bg=self.BG, fg=self.FG,
-            font=("Segoe UI", 10),
-            anchor="w",
-        ).grid(row=row, column=0, sticky="ew", padx=(24, 10), pady=4)
+        tk.Label(parent, text=label,
+                 bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10),
+                 anchor="w").grid(
+            row=row, column=0, sticky="ew",
+            padx=(24, 10), pady=4)
 
         val = self.config.get(cfg_key, "—").upper()
         btn = tk.Button(
-            parent,
-            text=val,
-            width=12,
+            parent, text=val, width=12,
             bg=self.CARD, fg=self.ACCENT,
             activebackground="#45475a", activeforeground=self.ACCENT,
             relief="flat", bd=0, padx=8, pady=7,
-            font=("Segoe UI", 10, "bold"),
-            cursor="hand2",
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
         )
         btn.grid(row=row, column=1, columnspan=2,
                  padx=(0, 24), pady=4, sticky="e")
@@ -276,16 +409,12 @@ class SettingsWindow:
     # ── Key recording ─────────────────────────────────────────
 
     def _toggle_record(self, btn: tk.Button, cfg_key: str):
-        # Cancel if already recording this key
         if self._recording == cfg_key:
             self._stop_record(cancelled=True)
             return
-
-        # Stop any other ongoing recording
         if self._recording is not None:
             self._stop_record(cancelled=True)
 
-        # Start recording
         self._recording = cfg_key
         btn.config(text="▶ press a key…", bg=self.ORANGE, fg="#1e1e2e")
 
@@ -295,8 +424,9 @@ class SettingsWindow:
             ks = key_to_str(key)
             self.config[cfg_key] = ks
             if self._win:
-                self._win.after(0, lambda: self._apply_record(btn, cfg_key, ks))
-            return False  # stop listener
+                self._win.after(
+                    0, lambda: self._apply_record(btn, cfg_key, ks))
+            return False
 
         lst = keyboard.Listener(on_press=_on_press)
         lst.daemon = True
@@ -305,7 +435,7 @@ class SettingsWindow:
 
     def _apply_record(self, btn: tk.Button, cfg_key: str, key_str: str):
         btn.config(text=key_str.upper(), bg=self.CARD, fg=self.ACCENT)
-        self._recording = None
+        self._recording    = None
         self._tmp_listener = None
 
     def _stop_record(self, cancelled: bool = False):
@@ -362,23 +492,23 @@ class SettingsWindow:
 class ScreenFreezer:
 
     def __init__(self):
-        self.frozen            = False
-        self.freeze_windows    = []
-        self.saved_screenshots = []   # set by capture_and_save()
-        self.listener          = None
-        self.current_keys      = set()
-        self.tray_icon         = None
-        self.config            = load_config()
-        self._settings_win     = None
+        self.frozen             = False
+        self.freeze_windows     = []
+        self.saved_screenshots  = []
+        self.listener           = None
+        self.current_keys       = set()
+        self.tray_icon          = None
+        self.config             = load_config()
+        self._settings_win      = None
 
         self._ensure_capture_folder()
         self._print_banner()
 
-    # ── Helpers ───────────────────────────────────────────────
+    # ── Setup ──────────────────────────────────────────────────
 
     def _ensure_capture_folder(self):
-        os.makedirs(self.config.get("capture_folder",
-                                    DEFAULT_CONFIG["capture_folder"]), exist_ok=True)
+        os.makedirs(self.config.get(
+            "capture_folder", DEFAULT_CONFIG["capture_folder"]), exist_ok=True)
 
     def _print_banner(self):
         c = self.config
@@ -399,35 +529,28 @@ class ScreenFreezer:
             self.listener.stop()
         self.start_listener()
         c = new_cfg
-        print(f"Config updated — Capture={c['capture_key'].upper()}  "
+        print(f"Config updated — "
+              f"Capture={c['capture_key'].upper()}  "
               f"Freeze={c['freeze_key'].upper()}  "
               f"Unfreeze={c['unfreeze_key'].upper()}")
 
     # ── Tray icon ─────────────────────────────────────────────
 
-    def _tray_image(self):
-        img  = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d    = ImageDraw.Draw(img)
-        d.ellipse([4, 4, 60, 60], fill=(30, 144, 255, 255),
-                  outline=(0, 100, 200, 255), width=3)
-        d.rectangle([22, 20, 28, 44], fill=(255, 255, 255, 255))
-        d.rectangle([36, 20, 42, 44], fill=(255, 255, 255, 255))
-        return img
-
     def setup_tray_icon(self):
+        tray_img = make_tray_icon()
         menu = pystray.Menu(
-            item("Screen Freeze Tool",   lambda *_: None, enabled=False),
+            item("Screen Freeze Tool",  lambda *_: None, enabled=False),
             pystray.Menu.SEPARATOR,
-            item("📸  Capture screens",  lambda *_: root.after(0, self.capture_and_save)),
-            item("🔒  Freeze",           lambda *_: root.after(0, self.freeze_screens)),
-            item("🔓  Unfreeze",         lambda *_: root.after(0, self.unfreeze_screens)),
+            item("📸  Capture screens", lambda *_: root.after(0, self.capture_and_save)),
+            item("🔒  Freeze",          lambda *_: root.after(0, self.freeze_screens)),
+            item("🔓  Unfreeze",        lambda *_: root.after(0, self.unfreeze_screens)),
             pystray.Menu.SEPARATOR,
-            item("⚙   Settings",         lambda *_: root.after(0, self._open_settings)),
+            item("⚙   Settings",        lambda *_: root.after(0, self._open_settings)),
             pystray.Menu.SEPARATOR,
-            item("Exit",                self._tray_exit),
+            item("Exit",               self._tray_exit),
         )
         self.tray_icon = pystray.Icon(
-            "screen_freeze", self._tray_image(), "Screen Freeze Tool", menu)
+            "screen_freeze", tray_img, "Screen Freeze Tool", menu)
 
     def run_tray_icon(self):
         if self.tray_icon:
@@ -445,9 +568,9 @@ class ScreenFreezer:
     # ── Capture ────────────────────────────────────────────────
 
     def capture_and_save(self):
-        folder    = self.config.get("capture_folder", DEFAULT_CONFIG["capture_folder"])
+        folder = self.config.get("capture_folder", DEFAULT_CONFIG["capture_folder"])
         os.makedirs(folder, exist_ok=True)
-        ts        = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.saved_screenshots = []
 
         print(f"\nCapturing monitors → {folder}")
@@ -475,11 +598,11 @@ class ScreenFreezer:
             return
         if not self.saved_screenshots:
             ck = self.config["capture_key"].upper()
-            print(f"\nNo capture available — press {ck} first.\n")
+            print(f"\nNo capture yet — press {ck} first.\n")
             return
 
         print("Freezing screens…")
-        self.frozen = True
+        self.frozen       = True
         self.freeze_windows = []
 
         try:
@@ -490,11 +613,14 @@ class ScreenFreezer:
                 time.sleep(0.05)
 
             for win in self.freeze_windows:
-                try: win.update(); win.lift()
-                except Exception: pass
+                try:
+                    win.update(); win.lift()
+                except Exception:
+                    pass
 
             uk = self.config["unfreeze_key"].upper()
-            print(f"{len(self.freeze_windows)} monitor(s) frozen. Press {uk} to unfreeze.\n")
+            print(f"{len(self.freeze_windows)} monitor(s) frozen. "
+                  f"Press {uk} to unfreeze.\n")
         except Exception as e:
             print(f"Freeze error: {e}")
             self.frozen = False
@@ -533,10 +659,12 @@ class ScreenFreezer:
             return
         print("Unfreezing…")
         for win in self.freeze_windows:
-            try: win.destroy()
-            except Exception: pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
         self.freeze_windows = []
-        self.frozen = False
+        self.frozen         = False
         print("Unfrozen.\n")
 
     # ── Keyboard listener ──────────────────────────────────────
@@ -552,8 +680,10 @@ class ScreenFreezer:
         return False
 
     def on_press(self, key):
-        try: self.current_keys.add(key)
-        except Exception: pass
+        try:
+            self.current_keys.add(key)
+        except Exception:
+            pass
 
         if self._matches(key, "capture_key"):
             root.after(0, self.capture_and_save)
@@ -587,10 +717,14 @@ def on_closing():
     if freezer.listener:
         freezer.listener.stop()
     if freezer.tray_icon:
-        try: freezer.tray_icon.stop()
-        except Exception: pass
-    try: root.destroy()
-    except Exception: pass
+        try:
+            freezer.tray_icon.stop()
+        except Exception:
+            pass
+    try:
+        root.destroy()
+    except Exception:
+        pass
     sys.exit(0)
 
 
@@ -598,6 +732,13 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
     root.update()
+
+    # Set app icon on the hidden root so all child windows inherit it
+    try:
+        _root_icon = make_tk_icon(root, size=48)
+        root.wm_iconphoto(True, _root_icon)
+    except Exception:
+        pass
 
     freezer = ScreenFreezer()
     freezer.start_listener()
