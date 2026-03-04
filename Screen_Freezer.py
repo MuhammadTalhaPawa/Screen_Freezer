@@ -211,10 +211,11 @@ class SettingsWindow:
     GREEN  = "#a6e3a1"
     ORANGE = "#fab387"
 
-    def __init__(self, master, config: dict, on_save_cb):
+    def __init__(self, master, config: dict, on_save_cb, on_close_cb=None):
         self.master        = master
         self.config        = config.copy()
         self.on_save_cb    = on_save_cb
+        self.on_close_cb   = on_close_cb   # called whenever the window closes (save or cancel)
         self._win          = None
         self._btns         = {}
         self._recording    = None
@@ -470,11 +471,15 @@ class SettingsWindow:
         save_config(self.config)
         self.on_save_cb(self.config)
         self._destroy()
+        if self.on_close_cb:
+            self.on_close_cb()
         print("Settings saved.")
 
     def _on_cancel(self):
         self._stop_record(cancelled=True)
         self._destroy()
+        if self.on_close_cb:
+            self.on_close_cb()
 
     def _destroy(self):
         if self._win:
@@ -500,6 +505,7 @@ class ScreenFreezer:
         self.tray_icon          = None
         self.config             = load_config()
         self._settings_win      = None
+        self.shortcuts_paused   = False   # True while Settings window is open
 
         self._ensure_capture_folder()
         self._print_banner()
@@ -562,8 +568,18 @@ class ScreenFreezer:
 
     def _open_settings(self):
         if self._settings_win is None:
-            self._settings_win = SettingsWindow(root, self.config, self.reload_config)
+            self._settings_win = SettingsWindow(
+                root, self.config,
+                on_save_cb=self.reload_config,
+                on_close_cb=self._resume_shortcuts,
+            )
+        self.shortcuts_paused = True
+        print("Shortcuts paused  (Settings is open)")
         self._settings_win.show()
+
+    def _resume_shortcuts(self):
+        self.shortcuts_paused = False
+        print("Shortcuts resumed")
 
     # ── Capture ────────────────────────────────────────────────
 
@@ -684,6 +700,10 @@ class ScreenFreezer:
             self.current_keys.add(key)
         except Exception:
             pass
+
+        # All hotkeys are silenced while the Settings window is open
+        if self.shortcuts_paused:
+            return
 
         if self._matches(key, "capture_key"):
             root.after(0, self.capture_and_save)
