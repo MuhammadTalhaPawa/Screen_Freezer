@@ -249,9 +249,10 @@ CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "screen_freezer_config.json"
 )
 DEFAULT_CONFIG = {
-    "freeze_key":     "f1",
-    "unfreeze_key":   "f2",
-    "capture_key":    "f3",
+    "freeze_key":      "f1",
+    "unfreeze_key":    "f2",
+    "capture_key":     "f3",
+    "run_on_startup":  False,
     # capture_folder is kept for config compatibility but storage
     # is now always the hidden encrypted store (_hidden_store_dir()).
 }
@@ -378,6 +379,139 @@ def combo_display(s: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+#  Startup helpers  (Windows registry / Linux .desktop / macOS LaunchAgent)
+# ─────────────────────────────────────────────────────────────
+
+_APP_NAME = "ScreenFreezer"
+
+def _exe_path() -> str:
+    """
+    Return the path that should be registered for startup.
+    Works both when running as a .py script and as a PyInstaller .exe.
+    """
+    import sys
+    if getattr(sys, "frozen", False):          # PyInstaller bundle
+        return sys.executable
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+
+def startup_is_enabled() -> bool:
+    """Return True if the app is currently registered to start on login."""
+    if os.name == "nt":
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_READ,
+            )
+            winreg.QueryValueEx(key, _APP_NAME)
+            winreg.CloseKey(key)
+            return True
+        except Exception:
+            return False
+
+    elif sys.platform == "darwin":
+        plist = os.path.expanduser(
+            f"~/Library/LaunchAgents/com.{_APP_NAME.lower()}.plist")
+        return os.path.exists(plist)
+
+    else:  # Linux / XDG autostart
+        desktop = os.path.expanduser(
+            f"~/.config/autostart/{_APP_NAME}.desktop")
+        return os.path.exists(desktop)
+
+
+def set_startup(enabled: bool):
+    """Register or remove the app from the OS startup list."""
+    if os.name == "nt":
+        _startup_windows(enabled)
+    elif sys.platform == "darwin":
+        _startup_macos(enabled)
+    else:
+        _startup_linux(enabled)
+
+
+def _startup_windows(enabled: bool):
+    import winreg
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, key_path, 0,
+            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+        )
+        if enabled:
+            winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, _exe_path())
+            print(f"Startup enabled  (registry: HKCU\\...\\Run\\{_APP_NAME})")
+        else:
+            try:
+                winreg.DeleteValue(key, _APP_NAME)
+                print("Startup disabled  (registry entry removed)")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        print(f"Startup (Windows) error: {e}")
+
+
+def _startup_macos(enabled: bool):
+    import sys
+    plist_path = os.path.expanduser(
+        f"~/Library/LaunchAgents/com.{_APP_NAME.lower()}.plist")
+    if enabled:
+        os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+        exe = sys.executable if getattr(sys, "frozen", False) else sys.executable
+        script = os.path.abspath(__file__)
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.{_APP_NAME.lower()}</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string><string>{script}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+</dict></plist>"""
+        with open(plist_path, "w") as f:
+            f.write(plist)
+        print(f"Startup enabled  ({plist_path})")
+    else:
+        try:
+            os.remove(plist_path)
+            print("Startup disabled  (LaunchAgent removed)")
+        except FileNotFoundError:
+            pass
+
+
+def _startup_linux(enabled: bool):
+    import sys
+    desktop_dir  = os.path.expanduser("~/.config/autostart")
+    desktop_path = os.path.join(desktop_dir, f"{_APP_NAME}.desktop")
+    if enabled:
+        os.makedirs(desktop_dir, exist_ok=True)
+        exe    = sys.executable if getattr(sys, "frozen", False) else sys.executable
+        script = os.path.abspath(__file__)
+        entry  = (
+            f"[Desktop Entry]\n"
+            f"Type=Application\n"
+            f"Name={_APP_NAME}\n"
+            f"Exec={exe} {script}\n"
+            f"Hidden=false\n"
+            f"NoDisplay=false\n"
+            f"X-GNOME-Autostart-enabled=true\n"
+        )
+        with open(desktop_path, "w") as f:
+            f.write(entry)
+        print(f"Startup enabled  ({desktop_path})")
+    else:
+        try:
+            os.remove(desktop_path)
+            print("Startup disabled  (.desktop entry removed)")
+        except FileNotFoundError:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────
 #  Settings Window
 # ─────────────────────────────────────────────────────────────
 
@@ -487,9 +621,61 @@ class SettingsWindow:
         # ── Divider ──────────────────────────────────────────
         self._divider(win, row=7)
 
+        # ── Section: startup ─────────────────────────────────
+        self._section(win, row=8, text="SYSTEM")
+
+        # Checkbox row
+        startup_row = tk.Frame(win, bg=self.BG)
+        startup_row.grid(row=9, column=0, columnspan=3,
+                         sticky="ew", padx=24, pady=(2, 8))
+
+        self._startup_var = tk.BooleanVar(
+            value=bool(self.config.get("run_on_startup", startup_is_enabled())))
+
+        # Custom-styled checkbox using a canvas toggle
+        def _make_toggle(parent, var):
+            W, H, R = 46, 24, 11
+            canvas = tk.Canvas(parent, width=W, height=H,
+                                bg=self.BG, highlightthickness=0, cursor="hand2")
+
+            def _redraw(*_):
+                canvas.delete("all")
+                on = var.get()
+                track_color = "#a6e3a1" if on else "#45475a"
+                canvas.create_rounded_rect = None   # not available, draw manually
+                # Track (rounded rect via oval + rect)
+                canvas.create_oval(0, 0, H, H, fill=track_color, outline="")
+                canvas.create_oval(W-H, 0, W, H, fill=track_color, outline="")
+                canvas.create_rectangle(H//2, 0, W-H//2, H,
+                                         fill=track_color, outline="")
+                # Thumb
+                tx = W - H + 3 if on else 3
+                canvas.create_oval(tx, 3, tx+H-6, H-3,
+                                   fill="white", outline="")
+
+            def _toggle(_e=None):
+                var.set(not var.get())
+                _redraw()
+
+            canvas.bind("<Button-1>", _toggle)
+            var.trace_add("write", _redraw)
+            _redraw()
+            return canvas
+
+        toggle = _make_toggle(startup_row, self._startup_var)
+        toggle.pack(side="left", padx=(0, 10))
+
+        tk.Label(startup_row,
+                 text="Launch Screen Freezer when Windows starts",
+                 bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side="left")
+
+        # ── Divider ──────────────────────────────────────────
+        self._divider(win, row=10)
+
         # ── Save / Cancel ────────────────────────────────────
         btn_row = tk.Frame(win, bg=self.BG)
-        btn_row.grid(row=8, column=0, columnspan=3,
+        btn_row.grid(row=11, column=0, columnspan=3,
                      sticky="e", padx=24, pady=(4, 20))
 
         tk.Button(
@@ -546,7 +732,7 @@ class SettingsWindow:
 
         val = combo_display(self.config.get(cfg_key, ""))
         btn = tk.Button(
-            parent, text=val, width=16,
+            parent, text=val, width=12,
             bg=self.CARD, fg=self.ACCENT,
             activebackground="#45475a", activeforeground=self.ACCENT,
             relief="flat", bd=0, padx=8, pady=7,
@@ -645,6 +831,10 @@ class SettingsWindow:
 
     def _on_save(self):
         self._stop_record(cancelled=True)
+        # Persist startup preference and apply to OS
+        startup_val = bool(self._startup_var.get())
+        self.config["run_on_startup"] = startup_val
+        set_startup(startup_val)
         save_config(self.config)
         self.on_save_cb(self.config)
         self._destroy()
