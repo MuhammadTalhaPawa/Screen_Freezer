@@ -16,10 +16,107 @@ import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw
 import mss
 from pynput import keyboard
-import sys, time, os, json, threading, datetime, math, io
+import sys, time, os, json, threading, datetime, math, io, hashlib, struct, socket
 import pystray
 from pystray import MenuItem as item
 from tkinter import filedialog
+
+
+# ─────────────────────────────────────────────────────────────
+#  Encrypted frame store
+#  Files are saved as .sfdat — a custom binary format.
+#  No standard image viewer can open them.
+#  The XOR key is derived from a machine fingerprint so the
+#  files are also unreadable on any other machine.
+# ─────────────────────────────────────────────────────────────
+
+_MAGIC   = b"SFDAT\x01"          # 6-byte magic header
+_EXT     = ".sfdat"
+
+def _machine_key() -> bytes:
+    """Derive a 32-byte key from hardware identifiers."""
+    seed = socket.gethostname() + os.path.expanduser("~")
+    return hashlib.sha256(seed.encode()).digest()   # 32 bytes
+
+def _xor_bytes(data: bytes, key: bytes) -> bytes:
+    """XOR data against the repeating key — fast via bytearray."""
+    klen   = len(key)
+    result = bytearray(len(data))
+    for i, b in enumerate(data):
+        result[i] = b ^ key[i % klen]
+    return bytes(result)
+
+def _hidden_store_dir() -> str:
+    """
+    Return a path that looks like a system/temp folder.
+    On Windows: %LOCALAPPDATA%/Microsoft/CLR_Security/cache
+    Elsewhere  : ~/.cache/.sfdata
+    Uses a dot-prefix on all platforms so it's hidden by default.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        return os.path.join(base, "Microsoft", "CLR_Security", ".cache")
+    else:
+        return os.path.join(os.path.expanduser("~"), ".cache", ".sfdata")
+
+def save_encrypted(img: Image.Image, directory: str, basename: str) -> str:
+    """
+    Save *img* as an encrypted .sfdat file.
+    Returns the full file path.
+
+    Binary layout:
+        6 bytes  magic
+        4 bytes  width  (uint32 LE)
+        4 bytes  height (uint32 LE)
+        N bytes  XOR-encrypted raw RGB bytes
+    """
+    os.makedirs(directory, exist_ok=True)
+
+    # On Windows also mark folder as hidden/system
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(directory, 0x02 | 0x04)
+        except Exception:
+            pass
+
+    path     = os.path.join(directory, basename + _EXT)
+    key      = _machine_key()
+    raw      = img.convert("RGB").tobytes()           # flat RGB
+    w, h     = img.size
+    header   = _MAGIC + struct.pack("<II", w, h)
+    encrypted = _xor_bytes(raw, key)
+
+    with open(path, "wb") as f:
+        f.write(header + encrypted)
+
+    return path
+
+def load_encrypted(path: str) -> Image.Image:
+    """
+    Load and decrypt an .sfdat file back to a PIL Image.
+    Raises ValueError on bad magic / corrupt file.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+
+    if len(data) < 14:
+        raise ValueError("File too small")
+    magic = data[:6]
+    if magic != _MAGIC:
+        raise ValueError(f"Bad magic: {magic!r}")
+
+    w, h      = struct.unpack("<II", data[6:14])
+    encrypted = data[14:]
+    key       = _machine_key()
+    raw       = _xor_bytes(encrypted, key)
+
+    expected = w * h * 3
+    if len(raw) != expected:
+        raise ValueError(f"Size mismatch: got {len(raw)}, expected {expected}")
+
+    return Image.frombytes("RGB", (w, h), raw)
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -155,9 +252,8 @@ DEFAULT_CONFIG = {
     "freeze_key":     "f1",
     "unfreeze_key":   "f2",
     "capture_key":    "f3",
-    "capture_folder": os.path.join(
-        os.path.expanduser("~"), "Pictures", "ScreenFreezer"
-    ),
+    # capture_folder is kept for config compatibility but storage
+    # is now always the hidden encrypted store (_hidden_store_dir()).
 }
 
 def load_config() -> dict:
@@ -391,39 +487,9 @@ class SettingsWindow:
         # ── Divider ──────────────────────────────────────────
         self._divider(win, row=7)
 
-        # ── Section: folder ──────────────────────────────────
-        self._section(win, row=8, text="SCREENSHOT SAVE FOLDER")
-
-        self._folder_var = tk.StringVar(
-            value=self.config.get("capture_folder", ""))
-
-        folder_entry = tk.Entry(
-            win,
-            textvariable=self._folder_var,
-            bg=self.CARD, fg=self.FG,
-            insertbackground=self.FG,
-            relief="flat", bd=0,
-            font=("Segoe UI", 9),
-            width=34,
-        )
-        folder_entry.grid(row=9, column=0, columnspan=2,
-                          padx=(24, 6), pady=6, ipady=7, sticky="ew")
-
-        tk.Button(
-            win, text="Browse…",
-            bg=self.CARD, fg=self.FG,
-            activebackground="#45475a", activeforeground=self.FG,
-            relief="flat", bd=0, padx=10, pady=7,
-            font=("Segoe UI", 9), cursor="hand2",
-            command=self._browse,
-        ).grid(row=9, column=2, padx=(0, 24), pady=6, sticky="w")
-
-        # ── Divider ──────────────────────────────────────────
-        self._divider(win, row=10)
-
         # ── Save / Cancel ────────────────────────────────────
         btn_row = tk.Frame(win, bg=self.BG)
-        btn_row.grid(row=11, column=0, columnspan=3,
+        btn_row.grid(row=8, column=0, columnspan=3,
                      sticky="e", padx=24, pady=(4, 20))
 
         tk.Button(
@@ -480,7 +546,7 @@ class SettingsWindow:
 
         val = combo_display(self.config.get(cfg_key, ""))
         btn = tk.Button(
-            parent, text=val, width=12,
+            parent, text=val, width=16,
             bg=self.CARD, fg=self.ACCENT,
             activebackground="#45475a", activeforeground=self.ACCENT,
             relief="flat", bd=0, padx=8, pady=7,
@@ -577,17 +643,8 @@ class SettingsWindow:
 
     # ── Actions ───────────────────────────────────────────────
 
-    def _browse(self):
-        d = filedialog.askdirectory(
-            title="Choose screenshot save folder",
-            initialdir=self._folder_var.get() or os.path.expanduser("~"),
-        )
-        if d:
-            self._folder_var.set(d)
-
     def _on_save(self):
         self._stop_record(cancelled=True)
-        self.config["capture_folder"] = self._folder_var.get().strip()
         save_config(self.config)
         self.on_save_cb(self.config)
         self._destroy()
@@ -633,8 +690,7 @@ class ScreenFreezer:
     # ── Setup ──────────────────────────────────────────────────
 
     def _ensure_capture_folder(self):
-        os.makedirs(self.config.get(
-            "capture_folder", DEFAULT_CONFIG["capture_folder"]), exist_ok=True)
+        os.makedirs(_hidden_store_dir(), exist_ok=True)
 
     def _print_banner(self):
         c = self.config
@@ -704,24 +760,22 @@ class ScreenFreezer:
     # ── Capture ────────────────────────────────────────────────
 
     def capture_and_save(self):
-        folder = self.config.get("capture_folder", DEFAULT_CONFIG["capture_folder"])
-        os.makedirs(folder, exist_ok=True)
-        ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        store_dir = _hidden_store_dir()
+        ts        = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.saved_screenshots = []
 
-        print(f"\nCapturing monitors → {folder}")
+        print(f"\nCapturing monitors…")
 
         with mss.mss() as sct:
             for i, mon in enumerate(sct.monitors[1:], 1):
                 try:
-                    shot = sct.grab(mon)
-                    img  = Image.frombytes("RGB", shot.size, shot.rgb)
-                    name = f"monitor_{i}_{ts}.png"
-                    path = os.path.join(folder, name)
-                    img.save(path)
+                    shot     = sct.grab(mon)
+                    img      = Image.frombytes("RGB", shot.size, shot.rgb)
+                    basename = f"sf_{i}_{ts}"
+                    path     = save_encrypted(img, store_dir, basename)
                     self.saved_screenshots.append(
                         {"image": img, "monitor": mon, "index": i, "path": path})
-                    print(f"  Monitor {i} saved → {name}")
+                    print(f"  Monitor {i} captured")
                 except Exception as e:
                     print(f"  Monitor {i} error: {e}")
 
